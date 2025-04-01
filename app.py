@@ -19,18 +19,20 @@ def process_logs(df):
     cutoff_date = pd.Timestamp("2025-02-19")
     start_date = pd.Timestamp("2024-12-23")
 
-    df["user_display"] = df.apply(
-        lambda row: row["user"] if row["timestamp"] < cutoff_date else row["userName"], axis=1
-    )
+    # Xác định cột tên người dùng: Ưu tiên 'user', nếu không có thì lấy 'userName'
+    if "user" in df.columns:
+        df["user_final"] = df["user"].fillna(df["userName"])
+    else:
+        df["user_final"] = df["userName"]
+
+    df = df.dropna(subset=["user_final"])  # Loại bỏ dòng không có user nào cả
 
     df = df[df["logType"] != "leaveRoom"]
-
-    df = df.sort_values(["user_display", "timestamp"])
-
-    df["time_diff"] = df.groupby("user_display")["timestamp"].diff()
+    df = df.sort_values(["user_final", "timestamp"])
 
     df["custom_week"] = ((df["timestamp"] - start_date).dt.days // 7) + 1
 
+    df["time_diff"] = df.groupby("user_final")["timestamp"].diff()
     df["time_diff_seconds"] = df["time_diff"].dt.total_seconds()
 
     max_diff = 800 
@@ -38,12 +40,10 @@ def process_logs(df):
         lambda x: x if (x is not None and x > 0 and x <= max_diff) else 0
     )
 
-    study_time_per_week = df.groupby(["user_display", "custom_week"])["time_diff_seconds"].sum()
-
-    activity_per_week = df.groupby(["user_display", "custom_week"])["timestamp"].count()
+    study_time_per_week = df.groupby(["user_final", "custom_week"])["time_diff_seconds"].sum()
+    activity_per_week = df.groupby(["user_final", "custom_week"])["timestamp"].count()
 
     max_activity_per_week = activity_per_week.groupby("custom_week").max()
-
     max_activity_series = pd.Series(index=activity_per_week.index)
     for week in activity_per_week.index.get_level_values('custom_week').unique():
         max_val = max_activity_per_week.loc[week]
@@ -52,18 +52,15 @@ def process_logs(df):
 
     hardworking_score = (activity_per_week / max_activity_series) * 100
 
-    study_time_q1 = study_time_per_week.groupby("custom_week").quantile(0.25)
-    study_time_q3 = study_time_per_week.groupby("custom_week").quantile(0.75)
-    study_time_min = study_time_per_week.groupby("custom_week").min()
-    study_time_iqr = study_time_q3 - study_time_q1
-
     hardworking_q1 = hardworking_score.groupby("custom_week").quantile(0.25)
     hardworking_q3 = hardworking_score.groupby("custom_week").quantile(0.75)
-    hardworking_min = hardworking_score.groupby("custom_week").min()
     hardworking_iqr = hardworking_q3 - hardworking_q1
+    hardworking_threshold = hardworking_q1 - 1.5 * hardworking_iqr
 
-    study_time_threshold = study_time_min.combine(study_time_q1 - study_time_iqr, min)
-    hardworking_threshold = hardworking_min.combine(hardworking_q1 - hardworking_iqr, min)
+    study_time_q1 = study_time_per_week.groupby("custom_week").quantile(0.25)
+    study_time_q3 = study_time_per_week.groupby("custom_week").quantile(0.75)
+    study_time_iqr = study_time_q3 - study_time_q1
+    study_time_threshold = study_time_q1 - 1.5 * study_time_iqr
 
     attendance_criteria = pd.DataFrame({
         "Total Study Time (s)": study_time_per_week,
@@ -72,15 +69,15 @@ def process_logs(df):
 
     attendance_criteria["Attendance"] = attendance_criteria.apply(
         lambda row: "✓" if row["Total Study Time (s)"] >= study_time_threshold.get(row["custom_week"], 0) and 
-                        row["Hardworking Score"] >= hardworking_threshold.get(row["custom_week"], 0) 
-                else "", axis=1
+                        row["Hardworking Score"] >= hardworking_threshold.get(row["custom_week"], 0)
+                    else "", axis=1
     )
 
-    weekly_attendance = attendance_criteria.pivot(index="user_display", columns="custom_week", values="Attendance")
-
+    weekly_attendance = attendance_criteria.pivot(index="user_final", columns="custom_week", values="Attendance")
+    
     return weekly_attendance.to_dict()
 
-@app.route("/api/hardworking2", methods=["GET"])
+@app.route("/api/hardworking3", methods=["GET"])
 def get_hardworking_data2():
     room_id = request.args.get("roomID")
     if not room_id:
@@ -88,7 +85,8 @@ def get_hardworking_data2():
 
     data = list(collection.find({"roomID": room_id}, {"_id": 0}))  
 
-    print("Dữ liệu từ MongoDB:", data)
+    if not data:
+        return jsonify({})
 
     df = pd.DataFrame(data)
     if df.empty:
